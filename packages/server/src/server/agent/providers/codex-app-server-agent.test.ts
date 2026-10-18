@@ -7928,6 +7928,104 @@ test("settles a nested spawn card before replaying its owner's timeline", async 
   app.assertNoErrors();
 });
 
+// Greptile round 2: a live update that lands while replay is still reading another child's
+// history must stay newer than the replayed snapshot. Emitting the saved timeline after that
+// live completion let the store merge the stale running item back in and drop its output.
+test("keeps a live child update newer than the replayed timeline it raced", async () => {
+  let app!: FakeCodexAppServer;
+  app = createFakeCodexAppServer({
+    "thread/read": (params) => {
+      const id = (params as { threadId: string }).threadId;
+      if (id === "child-b") {
+        // The live completion for child-a lands while the replay awaits this read.
+        app.completesCommand({
+          threadId: "child-a",
+          callId: "child-a-command",
+          command: "run tests",
+          output: "all green",
+        });
+        return { thread: { turns: [{ status: "completed", items: [] }] } };
+      }
+      if (id === "child-a") {
+        return {
+          thread: {
+            turns: [
+              {
+                status: "inProgress",
+                items: [
+                  {
+                    type: "commandExecution",
+                    id: "child-a-command",
+                    command: "run tests",
+                    status: "inProgress",
+                    aggregatedOutput: null,
+                    exitCode: null,
+                  },
+                ],
+              },
+            ],
+          },
+        };
+      }
+      return {
+        thread: {
+          turns: [
+            {
+              status: "completed",
+              items: [
+                {
+                  type: "collabAgentToolCall",
+                  id: "child-a-spawn",
+                  tool: "spawnAgent",
+                  status: "running",
+                  prompt: "Child work",
+                  receiverThreadIds: ["child-a", "child-b"],
+                  agentsStates: {
+                    "child-a": { status: "running" },
+                    "child-b": { status: "running" },
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      };
+    },
+  });
+  const session = new CodexAppServerAgentSession(
+    { provider: "codex", cwd: process.cwd(), modeId: "full-access" },
+    { sessionId: "parent" },
+    createTestLogger(),
+    async () => app.child,
+    {},
+    false,
+    false,
+    false,
+    undefined,
+  );
+  try {
+    await session.connect();
+    const racedItems: ToolCallTimelineItem[] = [];
+    for await (const event of session.streamHistory()) {
+      if (
+        event.type === "provider_subagent" &&
+        event.event.type === "timeline" &&
+        event.event.id === "child-a" &&
+        event.event.item.type === "tool_call" &&
+        event.event.item.callId === "child-a-command"
+      ) {
+        racedItems.push(event.event.item);
+      }
+    }
+    expect(racedItems.map((item) => item.status)).toEqual(["running", "completed"]);
+    expect(JSON.stringify(racedItems[0])).not.toContain("all green");
+    expect(JSON.stringify(racedItems.at(-1))).toContain("all green");
+  } finally {
+    await session.close();
+  }
+  app.assertNoErrors();
+});
+
 describe("Codex interactive resume startup", () => {
   test("delivers an autonomous turn that starts during resume to the first subscriber", async () => {
     const appServer = createFakeCodexAppServer({
