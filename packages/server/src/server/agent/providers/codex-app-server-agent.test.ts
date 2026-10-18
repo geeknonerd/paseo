@@ -7856,6 +7856,181 @@ test("keeps a status-less update on each child's own replayed status", () => {
   expect(statusesById.get("child-busy")).toBe("running");
 });
 
+// Greptile P1: a child that starts another turn after a recorded completion stays active in the
+// provider, so both its row and the parent spawn card must go back to running.
+test("reopens a child that is active again after a recorded completion", async () => {
+  const app = createFakeCodexAppServer({
+    "thread/read": (params) => {
+      const id = (params as { threadId: string }).threadId;
+      if (id !== "parent") {
+        return {
+          thread: {
+            status: { type: "active" },
+            turns: [{ status: "inProgress", items: [] }],
+          },
+        };
+      }
+      return {
+        thread: {
+          turns: [
+            {
+              status: "completed",
+              items: [
+                {
+                  type: "collabAgentToolCall",
+                  id: "resumed-spawn",
+                  tool: "spawnAgent",
+                  status: "completed",
+                  prompt: "First pass",
+                  receiverThreadIds: ["resumed-child"],
+                  agentsStates: { "resumed-child": { status: "completed" } },
+                },
+              ],
+            },
+          ],
+        },
+      };
+    },
+  });
+  const session = new CodexAppServerAgentSession(
+    { provider: "codex", cwd: process.cwd(), modeId: "full-access" },
+    { sessionId: "parent" },
+    createTestLogger(),
+    async () => app.child,
+    {},
+    false,
+    false,
+    false,
+    undefined,
+    "history",
+  );
+  try {
+    await session.connect();
+    const childStatuses = new Map<string, string | undefined>();
+    const cardStatuses = new Map<string, string | undefined>();
+    for await (const event of session.streamHistory()) {
+      if (event.type === "timeline" && event.item.type === "tool_call") {
+        cardStatuses.set(event.item.callId, event.item.status);
+      }
+      if (event.type === "provider_subagent" && event.event.type === "upsert") {
+        childStatuses.set(event.event.id, event.event.status);
+      }
+    }
+    expect(childStatuses.get("resumed-child")).toBe("running");
+    expect(cardStatuses.get("resumed-spawn")).toBe("running");
+  } finally {
+    await session.close();
+  }
+  app.assertNoErrors();
+});
+
+// Greptile P2: replayed child timelines used to be emitted before the grandchildren that settle
+// their spawn cards were read, so a nested card kept a stale running snapshot forever.
+test("settles a nested spawn card before replaying its owner's timeline", async () => {
+  const app = createFakeCodexAppServer({
+    "thread/read": (params) => {
+      const id = (params as { threadId: string }).threadId;
+      if (id === "grandchild") {
+        return {
+          thread: {
+            turns: [
+              {
+                status: "completed",
+                items: [{ type: "agentMessage", id: "grandchild-final", text: "Done." }],
+              },
+            ],
+          },
+        };
+      }
+      if (id === "child") {
+        return {
+          thread: {
+            turns: [
+              {
+                status: "completed",
+                items: [
+                  {
+                    type: "collabAgentToolCall",
+                    id: "grandchild-spawn",
+                    tool: "spawnAgent",
+                    status: "running",
+                    prompt: "Nested work",
+                    receiverThreadIds: ["grandchild"],
+                    agentsStates: { grandchild: { status: "running" } },
+                  },
+                ],
+              },
+            ],
+          },
+        };
+      }
+      return {
+        thread: {
+          turns: [
+            {
+              status: "completed",
+              items: [
+                {
+                  type: "collabAgentToolCall",
+                  id: "child-spawn",
+                  tool: "spawnAgent",
+                  status: "running",
+                  prompt: "Child work",
+                  receiverThreadIds: ["child"],
+                  agentsStates: { child: { status: "running" } },
+                },
+              ],
+            },
+          ],
+        },
+      };
+    },
+  });
+  const session = new CodexAppServerAgentSession(
+    { provider: "codex", cwd: process.cwd(), modeId: "full-access" },
+    { sessionId: "parent" },
+    createTestLogger(),
+    async () => app.child,
+    {},
+    false,
+    false,
+    false,
+    undefined,
+    "history",
+  );
+  try {
+    await session.connect();
+    const childStatuses = new Map<string, string | undefined>();
+    const rootCardStatuses = new Map<string, string | undefined>();
+    const nestedCardStatuses = new Map<string, string | undefined>();
+    for await (const event of session.streamHistory()) {
+      if (event.type === "timeline" && event.item.type === "tool_call") {
+        rootCardStatuses.set(event.item.callId, event.item.status);
+      }
+      if (event.type === "provider_subagent" && event.event.type === "upsert") {
+        childStatuses.set(event.event.id, event.event.status);
+      }
+      if (
+        event.type === "provider_subagent" &&
+        event.event.type === "timeline" &&
+        event.event.item.type === "tool_call"
+      ) {
+        nestedCardStatuses.set(
+          `${event.event.id}:${event.event.item.callId}`,
+          event.event.item.status,
+        );
+      }
+    }
+    expect(childStatuses.get("child")).toBe("completed");
+    expect(childStatuses.get("grandchild")).toBe("completed");
+    expect(rootCardStatuses.get("child-spawn")).toBe("completed");
+    expect(nestedCardStatuses.get("child:grandchild-spawn")).toBe("completed");
+  } finally {
+    await session.close();
+  }
+  app.assertNoErrors();
+});
+
 describe("Codex interactive resume startup", () => {
   test("delivers an autonomous turn that starts during resume to the first subscriber", async () => {
     const appServer = createFakeCodexAppServer({

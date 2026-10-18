@@ -512,12 +512,16 @@ interface CodexThreadHistoryProjection {
   subAgentRoutes: PersistedSubAgentRoute[];
   /** Native state of the thread itself, read from its latest turn; null when it is unknown. */
   status: ToolCallTimelineItem["status"] | null;
+  /** Whether the provider still holds the thread open, so it can start another turn. */
+  active: boolean;
   /**
    * Re-settles the replayed spawn cards once the children's own histories have been read.
-   * Each child only ever moves from a still-running snapshot to its terminal state.
+   * Each child either moves from a still-running snapshot to its terminal state or, while it is
+   * still active, reopens the card from an earlier terminal state.
    */
   settleSubAgentCards(
     childStatusByThreadId: ReadonlyMap<string, ToolCallTimelineItem["status"]>,
+    activeChildThreadIds?: ReadonlySet<string>,
   ): void;
 }
 
@@ -2128,16 +2132,22 @@ const CodexThreadReadResponseSchema = z
 type CodexThreadReadResponse = z.infer<typeof CodexThreadReadResponseSchema>;
 type CodexThreadReadRequest = (threadId: string) => Promise<unknown>;
 
+/** Whether the provider still holds the thread open, so it can start another turn. */
+function isCodexHistoryActive(thread: CodexThreadReadResponse["thread"]): boolean {
+  return toObjectRecord(thread.status)?.type === "active";
+}
+
 /**
- * The child's own thread is the authority on whether it finished. Legacy spawn entries and
+ * The thread's own history is the authority on whether it finished. Legacy spawn entries and
  * restored threads can hold only the spawn snapshot while the child's latest turn already
- * completed, so a terminal turn is read back onto the recorded status. Missing status and a
- * thread that is not loaded or active leave the recorded status untouched.
+ * completed, so a terminal turn is read back onto the recorded status. An active thread
+ * overrides both: it can start another turn after a recorded terminal state. Missing status and
+ * a thread that is not loaded leave the recorded status untouched.
  */
 function readCodexHistoryStatus(
   thread: CodexThreadReadResponse["thread"],
 ): ToolCallTimelineItem["status"] | null {
-  if (toObjectRecord(thread.status)?.type === "active") {
+  if (isCodexHistoryActive(thread)) {
     return "running";
   }
   switch (thread.turns.at(-1)?.status) {
@@ -2229,12 +2239,14 @@ async function loadCodexThreadHistoryTimeline(params: {
   );
   const settleSubAgentCards = (
     childStatusByThreadId: ReadonlyMap<string, ToolCallTimelineItem["status"]> = new Map(),
+    activeChildThreadIds: ReadonlySet<string> = new Set(),
   ): void => {
     settleReplayedSharedSubAgentCards({
       timeline,
       childThreadIdsByTimelineIndex,
       latestCollabStatusByChildThreadId,
       childHistoryStatusByChildThreadId: childStatusByThreadId,
+      activeChildThreadIds,
     });
   };
   settleSubAgentCards();
@@ -2242,6 +2254,7 @@ async function loadCodexThreadHistoryTimeline(params: {
     timeline,
     subAgentRoutes,
     status: readCodexHistoryStatus(response.thread),
+    active: isCodexHistoryActive(response.thread),
     settleSubAgentCards,
   };
 }
@@ -2279,18 +2292,33 @@ function addIndexedChildThreadId(
 
 /**
  * A spawn entry can own several children; settle the shared card only once every child has a
- * terminal state in the replayed history.
+ * terminal state in the replayed history. A child the provider still holds open overrides that:
+ * it can start another turn after a recorded terminal state, so the card reports it as running
+ * again instead of repeating the stale "finished" snapshot.
  */
 function settleReplayedSharedSubAgentCards(params: {
   timeline: PersistedTimelineEntry[];
   childThreadIdsByTimelineIndex: Map<number, Set<string>>;
   latestCollabStatusByChildThreadId: Map<string, ToolCallTimelineItem["status"]>;
   childHistoryStatusByChildThreadId?: ReadonlyMap<string, ToolCallTimelineItem["status"]>;
+  activeChildThreadIds?: ReadonlySet<string>;
 }): void {
   for (const [timelineIndex, childThreadIds] of params.childThreadIdsByTimelineIndex) {
     const entry = params.timeline[timelineIndex];
     const item = entry?.item;
     if (!entry || item?.type !== "tool_call" || item.detail.type !== "sub_agent") {
+      continue;
+    }
+    const hasActiveChild = [...childThreadIds].some((childThreadId) =>
+      params.activeChildThreadIds?.has(childThreadId),
+    );
+    if (hasActiveChild) {
+      if (item.status !== "running") {
+        params.timeline[timelineIndex] = {
+          ...entry,
+          item: applyCollabAgentToolCallStatus(item, "running"),
+        };
+      }
       continue;
     }
     if (isTerminalSubAgentStatus(item.status)) {
@@ -2313,6 +2341,20 @@ function settleReplayedSharedSubAgentCards(params: {
       item: applyCollabAgentToolCallStatus(item, aggregateCollabAgentChildStatuses(statuses)),
     };
   }
+}
+
+/**
+ * A child the provider still holds open can start another turn after a recorded completion, so
+ * its active state wins over the replayed snapshot instead of being ignored as "not terminal".
+ */
+function settleReplayedChildStatus(
+  recordedStatus: ToolCallTimelineItem["status"],
+  childHistory: CodexThreadHistoryProjection | null,
+): ToolCallTimelineItem["status"] {
+  if (childHistory?.active) {
+    return "running";
+  }
+  return settleCollabAgentChildStatus(recordedStatus, childHistory?.status ?? undefined);
 }
 
 function readCodexThread(client: CodexAppServerClientLike, threadId: string): Promise<unknown> {
@@ -4195,6 +4237,11 @@ export class CodexAppServerAgentSession implements AgentSession {
       parentSubagentId: null as string | null,
     }));
     const childStatusByThreadId = new Map<string, ToolCallTimelineItem["status"]>();
+    const activeChildThreadIds = new Set<string>();
+    const pendingSubAgentTimelines: Array<{
+      threadId: string;
+      history: CodexThreadHistoryProjection;
+    }> = [];
     const visitedThreadIds = new Set(this.currentThreadId ? [this.currentThreadId] : []);
     while (queue.length > 0 && visitedThreadIds.size < 100) {
       const next = queue.shift();
@@ -4218,12 +4265,17 @@ export class CodexAppServerAgentSession implements AgentSession {
       if (childHistory?.status) {
         childStatusByThreadId.set(next.route.childThreadId, childHistory.status);
       }
+      if (childHistory?.active) {
+        activeChildThreadIds.add(next.route.childThreadId);
+      }
       // Read the child before registering it so a child that finished after its spawn snapshot
       // settles its own row. Live notifications that arrived while reading stay buffered and are
       // replayed after registration, so they keep precedence over the replayed state.
+      // A child the provider still holds open overrides a terminal snapshot, because it can
+      // start another turn after a recorded completion.
       const timelineItem = applyCollabAgentToolCallStatus(
         next.route.toolCall,
-        settleCollabAgentChildStatus(next.route.toolCall.status, childHistory?.status ?? undefined),
+        settleReplayedChildStatus(next.route.toolCall.status, childHistory),
       );
       const registeredChildThreadIds = this.registerSubAgentToolCall({
         timelineItem,
@@ -4233,9 +4285,10 @@ export class CodexAppServerAgentSession implements AgentSession {
       });
       this.replayPendingSubAgentNotifications(registeredChildThreadIds);
       if (childHistory) {
-        for (const entry of childHistory.timeline) {
-          this.emitProviderSubagentTimeline(next.route.childThreadId, entry.item, entry.timestamp);
-        }
+        pendingSubAgentTimelines.push({
+          threadId: next.route.childThreadId,
+          history: childHistory,
+        });
         for (const route of childHistory.subAgentRoutes) {
           queue.push({
             route,
@@ -4245,7 +4298,18 @@ export class CodexAppServerAgentSession implements AgentSession {
         }
       }
     }
-    rootHistory.settleSubAgentCards(childStatusByThreadId);
+    // A nested spawn card can only be settled once every descendant history is in, so emit each
+    // replayed timeline after the whole tree has been read instead of freezing its cards in the
+    // snapshot that was current when its owner was visited.
+    for (const pending of pendingSubAgentTimelines) {
+      pending.history.settleSubAgentCards(childStatusByThreadId, activeChildThreadIds);
+    }
+    for (const pending of pendingSubAgentTimelines) {
+      for (const entry of pending.history.timeline) {
+        this.emitProviderSubagentTimeline(pending.threadId, entry.item, entry.timestamp);
+      }
+    }
+    rootHistory.settleSubAgentCards(childStatusByThreadId, activeChildThreadIds);
   }
 
   private async ensureThreadLoaded(): Promise<void> {
