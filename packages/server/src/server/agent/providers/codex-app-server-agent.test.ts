@@ -7538,9 +7538,8 @@ describe("Codex denied plan approvals", () => {
   });
 });
 
-// The retained child-history cases from the review of this change: a shared spawn whose
-// `agentsStates` still records every child as running, while each child's own latest turn
-// already says how it ended.
+// A shared spawn whose `agentsStates` still records every child as running, while each child's
+// own latest turn already says how it ended.
 test.each([
   { statuses: ["completed"], expected: ["completed"] },
   { statuses: ["completed", "inProgress"], expected: ["completed", "running"] },
@@ -7615,8 +7614,8 @@ test.each([
   },
 );
 
-// The minimized live report: the parent keeps only the legacy spawn snapshot, so the child's own
-// history is the only place the terminal state exists.
+// The parent keeps only the legacy spawn snapshot, so the child's own history is the only place
+// the terminal state exists.
 test.each([
   { turnStatus: "completed", expected: "completed" },
   { turnStatus: "interrupted", expected: "canceled" },
@@ -7707,54 +7706,84 @@ test.each([
   },
 );
 
-test("keeps a status-less update on each child's own replayed status", () => {
-  const session = createSession();
-  const internals = castInternals<{
-    registerSubAgentToolCall: (params: {
-      timelineItem: ToolCallTimelineItem;
-      rawItem: { [key: string]: unknown };
-      parentCallId: string | null;
-      parentSubagentId: string | null;
-    }) => string[];
-    emitSubAgentActivityUpdate: (callId: string) => void;
-  }>(session);
-  const card = (status: "completed" | "running"): ToolCallTimelineItem => ({
-    type: "tool_call",
-    callId: "shared-spawn",
-    name: "Sub-agent",
-    status,
-    error: null,
-    detail: { type: "sub_agent", subAgentType: "Sub-agent", log: "", actions: [] },
+test("keeps each child's own status through a status-less live update", async () => {
+  const app = createFakeCodexAppServer({
+    "thread/read": (params) => {
+      const id = (params as { threadId: string }).threadId;
+      if (id === "child-done") {
+        return { thread: { turns: [{ status: "completed", items: [] }] } };
+      }
+      if (id === "child-busy") {
+        return { thread: { turns: [{ status: "inProgress", items: [] }] } };
+      }
+      return {
+        thread: {
+          turns: [
+            {
+              status: "completed",
+              items: [
+                {
+                  type: "collabAgentToolCall",
+                  id: "shared-spawn",
+                  tool: "spawnAgent",
+                  status: "running",
+                  prompt: "Shared work",
+                  receiverThreadIds: ["child-done", "child-busy"],
+                  agentsStates: {
+                    "child-done": { status: "completed" },
+                    "child-busy": { status: "running" },
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      };
+    },
   });
-  internals.registerSubAgentToolCall({
-    timelineItem: card("completed"),
-    rawItem: { agentThreadId: "child-done" },
-    parentCallId: null,
-    parentSubagentId: null,
-  });
-  internals.registerSubAgentToolCall({
-    timelineItem: card("running"),
-    rawItem: { agentThreadId: "child-busy" },
-    parentCallId: null,
-    parentSubagentId: null,
-  });
-  const events: AgentStreamEvent[] = [];
-  session.subscribe((event) => events.push(event));
-
-  internals.emitSubAgentActivityUpdate("shared-spawn");
-
-  const statusesById = new Map<string, string | undefined>();
-  for (const event of events) {
-    if (event.type === "provider_subagent" && event.event.type === "upsert") {
-      statusesById.set(event.event.id, event.event.status);
+  const session = new CodexAppServerAgentSession(
+    { provider: "codex", cwd: process.cwd(), modeId: "full-access" },
+    { sessionId: "parent" },
+    createTestLogger(),
+    async () => app.child,
+    {},
+    false,
+    false,
+    false,
+    undefined,
+  );
+  try {
+    await session.connect();
+    const replayedStatuses = new Map<string, string | undefined>();
+    for await (const event of session.streamHistory()) {
+      if (event.type === "provider_subagent" && event.event.type === "upsert") {
+        replayedStatuses.set(event.event.id, event.event.status);
+      }
     }
+    expect(replayedStatuses.get("child-done")).toBe("completed");
+    expect(replayedStatuses.get("child-busy")).toBe("running");
+
+    const liveStatuses = new Map<string, string | undefined>();
+    session.subscribe((event) => {
+      if (event.type === "provider_subagent" && event.event.type === "upsert") {
+        liveStatuses.set(event.event.id, event.event.status);
+      }
+    });
+    // A child finishing an item reports no status of its own, so the shared card must keep each
+    // child on the state it already settled on instead of flattening both onto one status.
+    app.says({ threadId: "child-done", text: "Done." });
+    await vi.waitFor(() => {
+      expect(liveStatuses.get("child-done")).toBe("completed");
+      expect(liveStatuses.get("child-busy")).toBe("running");
+    });
+  } finally {
+    await session.close();
   }
-  expect(statusesById.get("child-done")).toBe("completed");
-  expect(statusesById.get("child-busy")).toBe("running");
+  app.assertNoErrors();
 });
 
-// Greptile P1: a child that starts another turn after a recorded completion stays active in the
-// provider, so both its row and the parent spawn card must go back to running.
+// A child that starts another turn after a recorded completion stays active in the provider, so
+// both its row and the parent spawn card must go back to running.
 test("reopens a child that is active again after a recorded completion", async () => {
   const app = createFakeCodexAppServer({
     "thread/read": (params) => {
@@ -7821,8 +7850,8 @@ test("reopens a child that is active again after a recorded completion", async (
   app.assertNoErrors();
 });
 
-// Greptile P2: replayed child timelines used to be emitted before the grandchildren that settle
-// their spawn cards were read, so a nested card kept a stale running snapshot forever.
+// Replayed child timelines are emitted only after the grandchildren that settle their spawn cards
+// have been read, so a nested card cannot freeze on a stale running snapshot.
 test("settles a nested spawn card before replaying its owner's timeline", async () => {
   const app = createFakeCodexAppServer({
     "thread/read": (params) => {
@@ -7928,9 +7957,9 @@ test("settles a nested spawn card before replaying its owner's timeline", async 
   app.assertNoErrors();
 });
 
-// Greptile round 2: a live update that lands while replay is still reading another child's
-// history must stay newer than the replayed snapshot. Emitting the saved timeline after that
-// live completion let the store merge the stale running item back in and drop its output.
+// A live update that lands while replay is still reading another child's history must stay newer
+// than the replayed snapshot, or the store merges the stale saved item over it and drops the live
+// output.
 test("keeps a live child update newer than the replayed timeline it raced", async () => {
   let app!: FakeCodexAppServer;
   app = createFakeCodexAppServer({
@@ -8017,9 +8046,17 @@ test("keeps a live child update newer than the replayed timeline it raced", asyn
         racedItems.push(event.event.item);
       }
     }
-    expect(racedItems.map((item) => item.status)).toEqual(["running", "completed"]);
-    expect(JSON.stringify(racedItems[0])).not.toContain("all green");
-    expect(JSON.stringify(racedItems.at(-1))).toContain("all green");
+    expect(racedItems).toHaveLength(2);
+    expect(racedItems[0]).toMatchObject({
+      callId: "child-a-command",
+      status: "running",
+      detail: { type: "shell", command: "run tests" },
+    });
+    expect(racedItems[1]).toMatchObject({
+      callId: "child-a-command",
+      status: "completed",
+      detail: { type: "shell", command: "run tests", output: "all green", exitCode: 0 },
+    });
   } finally {
     await session.close();
   }
