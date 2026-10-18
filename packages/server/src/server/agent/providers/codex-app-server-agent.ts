@@ -3678,6 +3678,14 @@ export class CodexAppServerAgentSession implements AgentSession {
   private persistedHistory: PersistedTimelineEntry[] = [];
   private loadingPersistedHistory = false;
   private persistedProviderSubagentEvents: AgentStreamEvent[] = [];
+  /**
+   * Provider sub-agent events that arrived from live notifications while persisted history was
+   * being replayed. They are appended after the replayed events, so a replayed snapshot can never
+   * land later than a live update that arrived while an earlier child was still being read.
+   */
+  private deferredLiveSubAgentEvents: AgentStreamEvent[] = [];
+  /** True while replay is emitting an event derived from the saved history itself. */
+  private emittingSavedSubAgentEvents = false;
   private pendingPermissions = new Map<string, AgentPermissionRequest>();
   private mcpElicitationPermissionIds = new Map<number, string>();
   private pendingPermissionHandlers = new Map<string, CodexPendingPermissionHandler>();
@@ -4208,10 +4216,16 @@ export class CodexAppServerAgentSession implements AgentSession {
     this.subAgentCallIdByChildThreadId.clear();
     this.pendingSubAgentNotificationsByThreadId.clear();
     this.persistedProviderSubagentEvents = [];
+    this.deferredLiveSubAgentEvents = [];
     this.loadingPersistedHistory = true;
     try {
       await this.loadPersistedSubAgentHistories(client, history);
     } finally {
+      // Live updates that arrived while the tree was being read must land after the replayed
+      // events, so the store keeps them as the newer state instead of being overwritten by the
+      // replayed snapshot they were racing against.
+      this.persistedProviderSubagentEvents.push(...this.deferredLiveSubAgentEvents);
+      this.deferredLiveSubAgentEvents = [];
       this.loadingPersistedHistory = false;
     }
     this.resetCodexUserMessageTurns();
@@ -4225,6 +4239,19 @@ export class CodexAppServerAgentSession implements AgentSession {
     }
     this.persistedHistory = timeline;
     this.historyPending = timeline.length > 0;
+  }
+
+  /**
+   * Emits a replayed provider sub-agent event while marking it as saved history, so it keeps its
+   * place ahead of live notifications that arrived during the same replay.
+   */
+  private withSavedSubAgentEvents<T>(emit: () => T): T {
+    this.emittingSavedSubAgentEvents = true;
+    try {
+      return emit();
+    } finally {
+      this.emittingSavedSubAgentEvents = false;
+    }
   }
 
   private async loadPersistedSubAgentHistories(
@@ -4277,12 +4304,14 @@ export class CodexAppServerAgentSession implements AgentSession {
         next.route.toolCall,
         settleReplayedChildStatus(next.route.toolCall.status, childHistory),
       );
-      const registeredChildThreadIds = this.registerSubAgentToolCall({
-        timelineItem,
-        rawItem: { agentThreadId: next.route.childThreadId },
-        parentCallId: next.parentCallId,
-        parentSubagentId: next.parentSubagentId,
-      });
+      const registeredChildThreadIds = this.withSavedSubAgentEvents(() =>
+        this.registerSubAgentToolCall({
+          timelineItem,
+          rawItem: { agentThreadId: next.route.childThreadId },
+          parentCallId: next.parentCallId,
+          parentSubagentId: next.parentSubagentId,
+        }),
+      );
       this.replayPendingSubAgentNotifications(registeredChildThreadIds);
       if (childHistory) {
         pendingSubAgentTimelines.push({
@@ -4304,11 +4333,13 @@ export class CodexAppServerAgentSession implements AgentSession {
     for (const pending of pendingSubAgentTimelines) {
       pending.history.settleSubAgentCards(childStatusByThreadId, activeChildThreadIds);
     }
-    for (const pending of pendingSubAgentTimelines) {
-      for (const entry of pending.history.timeline) {
-        this.emitProviderSubagentTimeline(pending.threadId, entry.item, entry.timestamp);
+    this.withSavedSubAgentEvents(() => {
+      for (const pending of pendingSubAgentTimelines) {
+        for (const entry of pending.history.timeline) {
+          this.emitProviderSubagentTimeline(pending.threadId, entry.item, entry.timestamp);
+        }
       }
-    }
+    });
     rootHistory.settleSubAgentCards(childStatusByThreadId, activeChildThreadIds);
   }
 
@@ -5653,7 +5684,11 @@ export class CodexAppServerAgentSession implements AgentSession {
 
   private emitEvent(event: AgentStreamEvent): void {
     if (this.loadingPersistedHistory && event.type === "provider_subagent") {
-      this.persistedProviderSubagentEvents.push(event);
+      if (this.emittingSavedSubAgentEvents) {
+        this.persistedProviderSubagentEvents.push(event);
+      } else {
+        this.deferredLiveSubAgentEvents.push(event);
+      }
       return;
     }
     this.notifySubscribers(event);
